@@ -5,63 +5,67 @@ INSTALL_DIR="${HOME}/.local/share/transcribe"
 MODEL_QUANT="Q8_0"
 MODEL_NAME="gigaam-v3-e2e-rnnt"
 MODEL_URL="https://huggingface.co/handy-computer/${MODEL_NAME}-gguf/resolve/main/${MODEL_NAME}-${MODEL_QUANT}.gguf"
-REPO="handy-computer/transcribe.cpp"
-BINARY_BASE="https://github.com/${REPO}/releases/download"
-API_LATEST="https://api.github.com/repos/${REPO}/releases/latest"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
-latest_release() {
-  curl -fsSL "$API_LATEST" |
-    grep -m1 '"tag_name"' |
-    sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/'
-}
+check_deps() {
+  local missing=()
+  for cmd in curl python3 arecord ydotool; do
+    command -v "$cmd" &>/dev/null || missing+=("$cmd")
+  done
 
-detect_arch() {
-  local arch
-  arch="$(uname -m)"
-  case "$arch" in
-    x86_64|amd64)
-      if command -v nvidia-smi &>/dev/null; then
-        echo "linux-x86_64-cuda"
-      else
-        echo "linux-x86_64-cpu-vulkan"
-      fi
-      ;;
-    aarch64|arm64)
-      echo "linux-aarch64-cpu-vulkan"
-      ;;
-    *)
-      echo "Unsupported arch: $arch" >&2; exit 1
-      ;;
-  esac
-}
-
-main() {
-  mkdir -p "$INSTALL_DIR/models"
-
-  local arch release tarball url
-  arch="$(detect_arch)"
-  release="$(latest_release)"
-  tarball="transcribe-native-${release#v}-${arch}.tar.gz"
-  url="${BINARY_BASE}/${release}/${tarball}"
-
-  if [ ! -f "${INSTALL_DIR}/transcribe-cli" ]; then
-    echo "==> Downloading transcribe.cpp ${release} (${arch})..."
-    curl -fSL "$url" | tar xz -C "$INSTALL_DIR" --strip-components=2 --wildcards '*/bin/*'
-    chmod +x "${INSTALL_DIR}/transcribe-cli"
+  if [ "${#missing[@]}" -gt 0 ]; then
+  echo "==> Missing dependencies: ${missing[*]}"
+  echo "    Arch / CachyOS:"
+  echo "      sudo pacman -S --needed curl python python-pip alsa-utils ydotool"
+  echo "    Debian / Ubuntu:"
+  echo "      sudo apt install curl python3 python3-pip python3-venv alsa-utils ydotool"
+  echo ""
+  echo "    ydotool also needs the user daemon:"
+  echo "      systemctl --user enable --now ydotoold"
+  exit 1
   fi
 
+  if ! pgrep -x ydotoold &>/dev/null; then
+    echo "==> Warning: ydotoold is not running."
+    echo "    Start it with: systemctl --user enable --now ydotoold"
+    echo ""
+  fi
+}
+
+install_python() {
+  if [ ! -d "${INSTALL_DIR}/venv" ]; then
+    echo "==> Creating Python venv and installing transcribe-cpp..."
+    python3 -m venv "${INSTALL_DIR}/venv"
+    "${INSTALL_DIR}/venv/bin/pip" install --upgrade pip
+    "${INSTALL_DIR}/venv/bin/pip" install transcribe-cpp
+  else
+    echo "==> Python venv already exists, skipping transcribe-cpp install"
+  fi
+
+  if [ -f "${SCRIPT_DIR}/transcribe.py" ]; then
+    install -m 644 "${SCRIPT_DIR}/transcribe.py" "${INSTALL_DIR}/transcribe.py"
+  else
+    echo "error: transcribe.py not found next to install.sh" >&2
+    exit 1
+  fi
+}
+
+download_model() {
   local model_file="${INSTALL_DIR}/models/${MODEL_NAME}-${MODEL_QUANT}.gguf"
   if [ ! -f "$model_file" ]; then
     echo "==> Downloading ${MODEL_NAME} model (${MODEL_QUANT})..."
     curl -fSL -o "$model_file" "$MODEL_URL"
   fi
+}
 
+write_transcribe_sh() {
   cat > "${INSTALL_DIR}/transcribe.sh" << 'SCRIPT'
 #!/usr/bin/env bash
 set -uo pipefail
 
 DIR="$(dirname "$(readlink -f "$0")")"
-CLI="${DIR}/transcribe-cli"
+PYTHON="${DIR}/venv/bin/python"
+TRANSCRIBE="${DIR}/transcribe.py"
 MODEL="${DIR}/models/gigaam-v3-e2e-rnnt-Q8_0.gguf"
 PIDFILE="/tmp/transcribe.pid"
 WAVFILE="/tmp/transcribe-rec.wav"
@@ -92,11 +96,16 @@ stop() {
   fi
 
   local text
-  text="$("$CLI" -m "$MODEL" "$WAVFILE" 2>/dev/null | tail -1)"
+  text="$("$PYTHON" "$TRANSCRIBE" "$MODEL" "$WAVFILE" 2>/dev/null || true)"
   rm -f "$WAVFILE"
 
   if [ -n "$text" ]; then
-    xdotool type --delay 0 "$text"
+    if command -v ydotool &>/dev/null; then
+      ydotool type --key-delay 0 -- "$text"
+    else
+      echo "ydotool not found" >&2
+      exit 1
+    fi
   fi
 }
 
@@ -107,23 +116,44 @@ case "${1:-}" in
 esac
 SCRIPT
   chmod +x "${INSTALL_DIR}/transcribe.sh"
+}
 
+configure_hyprland() {
   local hyprconf="${HOME}/.config/hypr/hyprland.conf"
-  if [ -f "$hyprconf" ]; then
-    if ! grep -q 'transcribe.sh start' "$hyprconf"; then
-      echo "" >> "$hyprconf"
-      echo "# transcribe.cpp hotkey" >> "$hyprconf"
-      echo "bind = , F9, keydown, exec, ${INSTALL_DIR}/transcribe.sh start" >> "$hyprconf"
-      echo "bind = , F9, keyup,   exec, ${INSTALL_DIR}/transcribe.sh stop" >> "$hyprconf"
-      echo "==> Added F9 hold-to-record binding to Hyprland config"
-    fi
+  if [ -f "$hyprconf" ] && ! grep -q 'transcribe.sh start' "$hyprconf"; then
+    echo "" >> "$hyprconf"
+    echo "# transcribe.cpp hotkey" >> "$hyprconf"
+    echo "bind = , F9, keydown, exec, ${INSTALL_DIR}/transcribe.sh start" >> "$hyprconf"
+    echo "bind = , F9, keyup,   exec, ${INSTALL_DIR}/transcribe.sh stop" >> "$hyprconf"
+    echo "==> Added F9 hold-to-record binding to Hyprland config"
   fi
+}
 
+main() {
+  echo "==> transcribe installer (Linux)"
+  echo "    Install dir: ${INSTALL_DIR}"
+  echo ""
+
+  check_deps
+  mkdir -p "${INSTALL_DIR}/models"
+
+  install_python
+  download_model
+  write_transcribe_sh
+  configure_hyprland
+
+  echo ""
   echo "==> Done!"
-  echo "    Binary:  ${INSTALL_DIR}/transcribe-cli"
-  echo "    Model:   ${model_file}"
+  echo "    Python:  ${INSTALL_DIR}/venv/bin/python"
+  echo "    Model:   ${INSTALL_DIR}/models/${MODEL_NAME}-${MODEL_QUANT}.gguf"
   echo "    Script:  ${INSTALL_DIR}/transcribe.sh"
-  echo "    F9: hold to record, release to transcribe & type"
+  echo "    F9: hold to record, release to transcribe and type"
+  echo ""
+  if [ ! -f "${HOME}/.config/hypr/hyprland.conf" ]; then
+    echo "    KDE Plasma: bind F9 in System Settings -> Custom Shortcuts:"
+    echo "      ${INSTALL_DIR}/transcribe.sh start   (trigger: on press)"
+    echo "      ${INSTALL_DIR}/transcribe.sh stop    (trigger: on release)"
+  fi
 }
 
 main "$@"

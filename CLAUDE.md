@@ -1,0 +1,1 @@
+C:/Users/ovchinn/transcribe/AGENTS.md
