@@ -18,7 +18,14 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake libvulkan-dev glslc libopenblas-dev
+          sudo apt-get install -y build-essential cmake libvulkan-dev libopenblas-dev wget gpg
+          # Ubuntu 22.04 main repo has no glslc; ggml-vulkan requires Google shaderc.
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo gpg --dearmor -o /usr/share/keyrings/lunarg.gpg
+          echo "deb [signed-by=/usr/share/keyrings/lunarg.gpg] https://packages.lunarg.com/vulkan jammy main" | sudo tee /etc/apt/sources.list.d/lunarg-vulkan.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y shaderc
+          command -v glslc
+          glslc --version | head -1
 
       - name: Checkout transcribe.cpp
         uses: actions/checkout@v4
