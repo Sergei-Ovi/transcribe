@@ -6,37 +6,19 @@ $ToolsDir = Join-Path $InstallDir 'tools'
 $ModelQuant = 'Q8_0'
 $ModelName = 'gigaam-v3-e2e-rnnt'
 $ModelUrl = "https://huggingface.co/handy-computer/${ModelName}-gguf/resolve/main/${ModelName}-${ModelQuant}.gguf"
+$ReleaseRepo = if ($env:TRANSCRIBE_RELEASE_REPO) { $env:TRANSCRIBE_RELEASE_REPO } else { 'Sergei-Ovi/transcribe' }
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $AhkUrl = 'https://www.autohotkey.com/download/ahk-v2.zip'
 $FfmpegUrl = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
+$CliAsset = 'transcribe-cli-windows-x86_64.exe'
 
 function Write-Step([string]$Message) {
     Write-Host "==> $Message"
 }
 
-function Find-Python {
-    foreach ($candidate in @('python', 'python3', 'py')) {
-        if (-not (Get-Command $candidate -ErrorAction SilentlyContinue)) { continue }
-        if ($candidate -eq 'py') {
-            $version = & py -3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null
-            if ($LASTEXITCODE -eq 0 -and [version]$version -ge [version]'3.9') {
-                return @{ Command = 'py'; Args = @('-3') }
-            }
-            continue
-        }
-        $version = & $candidate -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null
-        if ($LASTEXITCODE -eq 0 -and [version]$version -ge [version]'3.9') {
-            return @{ Command = $candidate; Args = @() }
-        }
-    }
-    return $null
-}
-
-function Invoke-Python([hashtable]$Python, [string[]]$ScriptArgs) {
-    & $Python.Command @($Python.Args + $ScriptArgs)
-    if ($LASTEXITCODE -ne 0) {
-        throw "python command failed: $($Python.Command) $($ScriptArgs -join ' ')"
-    }
+function Get-LatestRelease {
+    $response = Invoke-RestMethod "https://api.github.com/repos/$ReleaseRepo/releases/latest"
+    return $response.tag_name
 }
 
 function Get-FfmpegPath {
@@ -49,7 +31,7 @@ function Get-FfmpegPath {
 function Ensure-Ffmpeg {
     if (Get-FfmpegPath) { return }
 
-    Write-Step "Downloading portable ffmpeg..."
+    Write-Step 'Downloading portable ffmpeg...'
     New-Item -ItemType Directory -Force -Path $ToolsDir | Out-Null
     $zipPath = Join-Path $env:TEMP 'transcribe-ffmpeg.zip'
     Invoke-WebRequest -Uri $FfmpegUrl -OutFile $zipPath -UseBasicParsing
@@ -65,7 +47,7 @@ function Ensure-AutoHotkey {
     $ahk = Join-Path $ToolsDir 'AutoHotkey64.exe'
     if (Test-Path $ahk) { return $ahk }
 
-    Write-Step "Downloading portable AutoHotkey v2..."
+    Write-Step 'Downloading portable AutoHotkey v2...'
     New-Item -ItemType Directory -Force -Path $ToolsDir | Out-Null
     $zipPath = Join-Path $env:TEMP 'transcribe-ahk.zip'
     Invoke-WebRequest -Uri $AhkUrl -OutFile $zipPath -UseBasicParsing
@@ -96,24 +78,22 @@ function Detect-Microphone([string]$Ffmpeg) {
     return $device
 }
 
-function Install-PythonEnv([hashtable]$Python) {
-    $venvPython = Join-Path $InstallDir 'venv\Scripts\python.exe'
-    if (-not (Test-Path $venvPython)) {
-        Write-Step 'Creating Python venv and installing transcribe-cpp...'
-        Invoke-Python $Python @('-m', 'venv', (Join-Path $InstallDir 'venv'))
-        & $venvPython -m pip install --upgrade pip
-        if ($LASTEXITCODE -ne 0) { throw 'pip upgrade failed' }
-        & $venvPython -m pip install transcribe-cpp
-        if ($LASTEXITCODE -ne 0) { throw 'transcribe-cpp install failed' }
-    } else {
-        Write-Step 'Python venv already exists, skipping transcribe-cpp install'
+function Install-Cli {
+    $cliPath = Join-Path $InstallDir 'transcribe-cli.exe'
+    if (Test-Path $cliPath) {
+        Write-Step 'transcribe-cli already installed, skipping download'
+        return
     }
 
-    $source = Join-Path $ScriptDir 'transcribe.py'
-    if (-not (Test-Path $source)) {
-        throw "transcribe.py not found next to install.ps1"
+    $release = Get-LatestRelease
+    $url = "https://github.com/$ReleaseRepo/releases/download/$release/$CliAsset"
+    Write-Step "Downloading transcribe-cli $release ($CliAsset)..."
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $cliPath -UseBasicParsing
+    } catch {
+        Remove-Item $cliPath -ErrorAction SilentlyContinue
+        throw "Failed to download $url. Publish a release first: git tag v1.0.0; git push origin v1.0.0"
     }
-    Copy-Item $source (Join-Path $InstallDir 'transcribe.py') -Force
 }
 
 function Install-Model {
@@ -126,82 +106,15 @@ function Install-Model {
     }
 }
 
-function Write-TranscribePs1 {
-    @'
-param(
-    [Parameter(Mandatory = $true)]
-    [ValidateSet('start', 'stop')]
-    [string]$Action
-)
-
-$ErrorActionPreference = 'Stop'
-
-$InstallDir = Join-Path $env:LOCALAPPDATA 'transcribe'
-$Python = Join-Path $InstallDir 'venv\Scripts\python.exe'
-$Transcribe = Join-Path $InstallDir 'transcribe.py'
-$Model = Join-Path $InstallDir 'models\gigaam-v3-e2e-rnnt-Q8_0.gguf'
-$PidFile = Join-Path $env:TEMP 'transcribe.pid'
-$WavFile = Join-Path $env:TEMP 'transcribe-rec.wav'
-$FfmpegLocal = Join-Path $InstallDir 'tools\ffmpeg.exe'
-$DeviceFile = Join-Path $InstallDir 'audio_device.txt'
-
-function Get-Ffmpeg {
-    if (Test-Path $FfmpegLocal) { return $FfmpegLocal }
-    return 'ffmpeg'
-}
-
-function Get-AudioDevice {
-    if ($env:TRANSCRIBE_AUDIO_DEVICE) { return $env:TRANSCRIBE_AUDIO_DEVICE }
-    if (Test-Path $DeviceFile) { return (Get-Content $DeviceFile -Raw).Trim() }
-    throw "Audio device not configured. Re-run install.ps1 or set TRANSCRIBE_AUDIO_DEVICE."
-}
-
-function Start-Recording {
-    if (Test-Path $PidFile) {
-        $oldPid = Get-Content $PidFile -Raw
-        if ($oldPid -and (Get-Process -Id $oldPid -ErrorAction SilentlyContinue)) { return }
+function Install-RuntimeScripts {
+    $sourcePs1 = Join-Path $ScriptDir 'transcribe.ps1'
+    if (-not (Test-Path $sourcePs1)) {
+        throw 'transcribe.ps1 not found next to install.ps1'
     }
-    if (Test-Path $WavFile) { Remove-Item $WavFile -Force }
-    $ffmpeg = Get-Ffmpeg
-    $device = Get-AudioDevice
-    $args = @('-y', '-hide_banner', '-loglevel', 'error', '-f', 'dshow', '-i', "audio=$device", '-ar', '16000', '-ac', '1', $WavFile)
-    $proc = Start-Process -FilePath $ffmpeg -ArgumentList $args -PassThru -WindowStyle Hidden
-    Set-Content -Path $PidFile -Value $proc.Id -NoNewline
-}
-
-function Stop-Recording {
-    if (-not (Test-Path $PidFile)) { return }
-    $procId = [int](Get-Content $PidFile -Raw)
-    Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
-    $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
-    if ($proc) {
-        Stop-Process -Id $procId -Force
-        Start-Sleep -Milliseconds 200
-    }
-    if (-not (Test-Path $WavFile) -or ((Get-Item $WavFile).Length -lt 32000)) {
-        if (Test-Path $WavFile) { Remove-Item $WavFile -Force }
-        return
-    }
-
-    $text = & $Python $Transcribe $Model $WavFile 2>$null
-    Remove-Item $WavFile -Force -ErrorAction SilentlyContinue
-    if (-not $text) { return }
-
-    Add-Type -AssemblyName System.Windows.Forms
-    [System.Windows.Forms.Clipboard]::SetText($text.Trim())
-    Start-Sleep -Milliseconds 80
-    [System.Windows.Forms.SendKeys]::SendWait('^v')
-}
-
-switch ($Action) {
-    'start' { Start-Recording }
-    'stop'  { Stop-Recording }
-}
-'@ | Set-Content -Path (Join-Path $InstallDir 'transcribe.ps1') -Encoding UTF8
+    Copy-Item $sourcePs1 (Join-Path $InstallDir 'transcribe.ps1') -Force
 }
 
 function Write-TranscribeAhk {
-    $ps1 = Join-Path $InstallDir 'transcribe.ps1'
     @"
 #Requires AutoHotkey v2.0
 #SingleInstance Force
@@ -238,28 +151,24 @@ function Install-StartupShortcut([string]$AhkExe) {
 function Main {
     Write-Step 'transcribe installer (Windows)'
     Write-Host "    Install dir: $InstallDir"
+    Write-Host "    Releases:    https://github.com/$ReleaseRepo/releases"
     Write-Host ''
-
-    $python = Find-Python
-    if (-not $python) {
-        throw 'Python 3.9+ not found. Install from https://www.python.org/downloads/ and re-run.'
-    }
 
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 
-    Install-PythonEnv $python
+    Install-Cli
     Install-Model
     Ensure-Ffmpeg
     $ffmpeg = Get-FfmpegPath
     Detect-Microphone $ffmpeg
-    Write-TranscribePs1
+    Install-RuntimeScripts
     Write-TranscribeAhk
     $ahk = Ensure-AutoHotkey
     Install-StartupShortcut $ahk
 
     Write-Host ''
     Write-Step 'Done!'
-    Write-Host "    Python:  $(Join-Path $InstallDir 'venv\Scripts\python.exe')"
+    Write-Host "    CLI:     $(Join-Path $InstallDir 'transcribe-cli.exe')"
     Write-Host "    Model:   $(Join-Path $InstallDir "models\${ModelName}-${ModelQuant}.gguf")"
     Write-Host "    Script:  $(Join-Path $InstallDir 'transcribe.ps1')"
     Write-Host "    Hotkey:  F9 hold-to-record (AutoHotkey, starts with Windows)"

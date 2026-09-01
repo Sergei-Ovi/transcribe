@@ -1,0 +1,91 @@
+name: Build transcribe-cli
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  TRANSCRIBE_CPP_REF: v0.2.3
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libvulkan-dev glslc libopenblas-dev
+
+      - name: Checkout transcribe.cpp
+        uses: actions/checkout@v4
+        with:
+          repository: handy-computer/transcribe.cpp
+          ref: ${{ env.TRANSCRIBE_CPP_REF }}
+          path: transcribe.cpp
+
+      - name: Build transcribe-cli (Vulkan)
+        working-directory: transcribe.cpp
+        run: |
+          cmake -B build -DTRANSCRIBE_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target transcribe-cli -j"$(nproc)"
+
+      - name: Stage Linux binary
+        run: |
+          install -Dm755 transcribe.cpp/build/bin/transcribe-cli dist/transcribe-cli-linux-x86_64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: transcribe-cli-linux-x86_64
+          path: dist/transcribe-cli-linux-x86_64
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout transcribe.cpp
+        uses: actions/checkout@v4
+        with:
+          repository: handy-computer/transcribe.cpp
+          ref: ${{ env.TRANSCRIBE_CPP_REF }}
+          path: transcribe.cpp
+
+      - name: Build transcribe-cli (CPU)
+        working-directory: transcribe.cpp
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target transcribe-cli --config Release -j 4
+
+      - name: Stage Windows binary
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item transcribe.cpp\build\bin\Release\transcribe-cli.exe dist\transcribe-cli-windows-x86_64.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: transcribe-cli-windows-x86_64
+          path: dist/transcribe-cli-windows-x86_64.exe
+
+  release:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/transcribe-cli-linux-x86_64
+            dist/transcribe-cli-windows-x86_64.exe
+          generate_release_notes: true
