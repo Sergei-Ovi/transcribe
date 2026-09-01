@@ -13,17 +13,13 @@ permissions:
 
 jobs:
   build-linux:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake libvulkan-dev libopenblas-dev wget gpg
-          # Ubuntu 22.04 main repo has no glslc; ggml-vulkan requires Google shaderc.
-          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo gpg --dearmor -o /usr/share/keyrings/lunarg.gpg
-          echo "deb [signed-by=/usr/share/keyrings/lunarg.gpg] https://packages.lunarg.com/vulkan jammy main" | sudo tee /etc/apt/sources.list.d/lunarg-vulkan.list >/dev/null
-          sudo apt-get update
-          sudo apt-get install -y shaderc
+          sudo apt-get install -y build-essential cmake ninja-build \
+            libvulkan-dev glslc spirv-headers libopenblas-dev
           command -v glslc
           glslc --version | head -1
 
@@ -37,8 +33,9 @@ jobs:
       - name: Build transcribe-cli (Vulkan)
         working-directory: transcribe.cpp
         run: |
-          cmake -B build -DTRANSCRIBE_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -G Ninja -DTRANSCRIBE_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
           cmake --build build --target transcribe-cli -j"$(nproc)"
+          test -f build/bin/transcribe-cli
 
       - name: Stage Linux binary
         run: |
